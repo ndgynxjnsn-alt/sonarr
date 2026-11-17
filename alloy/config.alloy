@@ -1,38 +1,13 @@
-// Grafana Alloy sidecar for the sonarr stack.
-// Logs:    docker logs of every container in compose project "sonarr" -> Loki
-// Metrics: traefik, sonarqube (/api/monitoring/metrics), postgres exporter -> Mimir
+// Grafana Alloy sidecar: SonarQube (logs + metrics) and the host node (metrics).
 
-// ---------------------------------------------------------------- logs
-discovery.docker "sonarr" {
-  host = "unix:///var/run/docker.sock"
-  filter {
-    name   = "label"
-    values = ["com.docker.compose.project=sonarr"]
-  }
+// SonarQube log files (sonar, web, ce, es, access), read from the shared logs volume.
+local.file_match "sonarqube" {
+  path_targets = [{"__path__" = "/sonarqube/logs/*.log", "service_name" = "sonarqube"}]
 }
 
-discovery.relabel "sonarr_logs" {
-  targets = discovery.docker.sonarr.targets
-  rule {
-    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
-    target_label  = "service_name"
-  }
-  rule {
-    source_labels = ["__meta_docker_container_name"]
-    regex         = "/(.*)"
-    target_label  = "container"
-  }
-  rule {
-    target_label = "project"
-    replacement  = "sonarr"
-  }
-}
-
-loki.source.docker "sonarr" {
-  host          = "unix:///var/run/docker.sock"
-  targets       = discovery.relabel.sonarr_logs.output
-  relabel_rules = discovery.relabel.sonarr_logs.rules
-  forward_to    = [loki.write.lgtm.receiver]
+loki.source.file "sonarqube" {
+  targets    = local.file_match.sonarqube.targets
+  forward_to = [loki.write.lgtm.receiver]
 }
 
 loki.write "lgtm" {
@@ -41,64 +16,35 @@ loki.write "lgtm" {
   }
 }
 
-// ------------------------------------------------------------- metrics
-prometheus.scrape "traefik" {
-  targets         = [{"__address__" = "traefik:8082", "service_name" = "traefik"}]
-  job_name        = "sonarr/traefik"
-  scrape_interval = "30s"
-  forward_to      = [prometheus.relabel.common.receiver]
-}
-
+// SonarQube Prometheus endpoint, authenticated with the system passcode.
 prometheus.scrape "sonarqube" {
   targets         = [{"__address__" = "sonarqube:9000", "service_name" = "sonarqube"}]
-  job_name        = "sonarr/sonarqube"
+  job_name        = "sonarqube"
   metrics_path    = "/api/monitoring/metrics"
   scrape_interval = "60s"
-  // SonarQube accepts the system passcode as a Bearer token on this endpoint.
   authorization {
     type        = "Bearer"
     credentials = sys.env("SONAR_MONITORING_PASSCODE")
   }
-  forward_to = [prometheus.relabel.common.receiver]
-}
-
-prometheus.exporter.postgres "sonarr" {
-  data_source_names = [sys.env("POSTGRES_DSN")]
-}
-
-discovery.relabel "postgres" {
-  targets = prometheus.exporter.postgres.sonarr.targets
-  rule {
-    target_label = "job"
-    replacement  = "sonarr/postgres"
-  }
-  rule {
-    target_label = "service_name"
-    replacement  = "postgres"
-  }
-  rule {
-    target_label = "instance"
-    replacement  = "postgres:5432"
-  }
-}
-
-prometheus.scrape "postgres" {
-  targets         = discovery.relabel.postgres.output
-  job_name        = "sonarr/postgres"
-  scrape_interval = "30s"
-  forward_to      = [prometheus.relabel.common.receiver]
-}
-
-prometheus.relabel "common" {
-  rule {
-    target_label = "project"
-    replacement  = "sonarr"
-  }
   forward_to = [prometheus.remote_write.lgtm.receiver]
+}
+
+// Host metrics (node_exporter equivalent) from the read-only host mounts.
+prometheus.exporter.unix "node" {
+  procfs_path = "/host/proc"
+  sysfs_path  = "/host/sys"
+  rootfs_path = "/host/root"
+}
+
+prometheus.scrape "node" {
+  targets         = prometheus.exporter.unix.node.targets
+  scrape_interval = "30s"
+  forward_to      = [prometheus.remote_write.lgtm.receiver]
 }
 
 prometheus.remote_write "lgtm" {
   endpoint {
     url = sys.env("MIMIR_URL")
   }
+  external_labels = {"project" = "sonarr"}
 }

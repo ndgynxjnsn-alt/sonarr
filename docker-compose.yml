@@ -3,7 +3,7 @@
 # metrics to an external LGTM stack (Loki + Mimir).
 #
 #   Internet --443--> traefik --> sonarqube --> postgres <-- pgbackup (pg_dump)
-#   alloy: docker logs + /metrics scrapes  -->  Loki / Mimir
+#   alloy: sonarqube logs/metrics + host (node) metrics  -->  Loki / Mimir
 #
 # Copy .env.example to .env and fill in the secrets before `docker compose up -d`.
 
@@ -21,24 +21,29 @@ services:
       - --entrypoints.web.http.redirections.entrypoint.to=websecure
       - --entrypoints.web.http.redirections.entrypoint.scheme=https
       - --entrypoints.websecure.address=:443
-      # Let's Encrypt via the built-in ACME client (HTTP-01). Traefik renews
-      # automatically ~30 days before expiry; no certbot needed.
-      - --certificatesresolvers.le.acme.email=${ACME_EMAIL}
-      - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
-      - --certificatesresolvers.le.acme.caserver=${ACME_CA_SERVER:-https://acme-v02.api.letsencrypt.org/directory}
-      - --certificatesresolvers.le.acme.httpchallenge.entrypoint=web
-      # Prometheus metrics on an internal-only entrypoint (scraped by alloy).
-      - --entrypoints.metrics.address=:8082
-      - --metrics.prometheus.entrypoint=metrics
+      # Company ACME CA (External Account Binding). Traefik's built-in ACME
+      # client issues and renews automatically; no certbot needed.
+      - --certificatesresolvers.company.acme.caserver=${ACME_CA_SERVER:?set ACME_CA_SERVER in .env}
+      - --certificatesresolvers.company.acme.email=${ACME_EMAIL}
+      - --certificatesresolvers.company.acme.eab.kid=${ACME_EAB_KID:?set ACME_EAB_KID in .env}
+      - --certificatesresolvers.company.acme.eab.hmacencoded=${ACME_EAB_HMAC:?set ACME_EAB_HMAC in .env}
+      - --certificatesresolvers.company.acme.keytype=${ACME_KEY_TYPE:-EC256}
+      - --certificatesresolvers.company.acme.storage=/acme/acme.json
+      - --certificatesresolvers.company.acme.httpchallenge.entrypoint=web
       - --global.aliasheadersstrategy=delete
       - --log.level=INFO
       - --accesslog=true
     ports:
       - "${HTTP_PORT:-80}:80"
       - "${HTTPS_PORT:-443}:443"
+    environment:
+      # PEM bundle of the company root CA, if the ACME server's TLS cert is not
+      # publicly trusted (e.g. /certs/company-root-ca.pem). Empty = system trust.
+      LEGO_CA_CERTIFICATES: ${ACME_CA_CERTIFICATES:-}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      - letsencrypt:/letsencrypt
+      - acme:/acme
+      - ./certs:/certs:ro
     networks: [web]
 
   sonarqube:
@@ -67,7 +72,7 @@ services:
       - traefik.http.routers.sonarqube.entrypoints=websecure
       - traefik.http.routers.sonarqube.tls=true
       # Empty TLS_CERTRESOLVER = no ACME, Traefik serves its self-signed default cert.
-      - traefik.http.routers.sonarqube.tls.certresolver=${TLS_CERTRESOLVER-le}
+      - traefik.http.routers.sonarqube.tls.certresolver=${TLS_CERTRESOLVER-company}
       - traefik.http.services.sonarqube.loadbalancer.server.port=9000
     networks: [web, db]
 
@@ -107,8 +112,8 @@ services:
       - ${BACKUP_DIR:-./backups}:/backups
     networks: [db]
 
-  # Observability sidecar: tails the stack's container logs and scrapes
-  # traefik, sonarqube and postgres metrics, then pushes to Loki and Mimir.
+  # Observability sidecar: SonarQube log files + /api/monitoring/metrics and
+  # host node metrics, pushed to Loki and Mimir.
   alloy:
     image: grafana/alloy:v1.22.0
     restart: unless-stopped
@@ -117,25 +122,29 @@ services:
       - --server.http.listen-addr=0.0.0.0:12345
       - --storage.path=/var/lib/alloy/data
       - /etc/alloy/config.alloy
+    pid: host
     environment:
       LOKI_URL: ${LOKI_URL:-http://host.docker.internal:3100/loki/api/v1/push}
       MIMIR_URL: ${MIMIR_URL:-http://host.docker.internal:9009/api/v1/push}
       SONAR_MONITORING_PASSCODE: ${SONAR_MONITORING_PASSCODE}
-      POSTGRES_DSN: postgresql://${POSTGRES_USER:-sonarqube}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-sonarqube}?sslmode=disable
     extra_hosts:
       - host.docker.internal:host-gateway
     volumes:
       - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
-      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - sonarqube_logs:/sonarqube/logs:ro
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host/root:ro,rslave
+      - /run/udev/data:/run/udev/data:ro
       - alloy_data:/var/lib/alloy/data
-    networks: [web, db]
+    networks: [web]
 
 networks:
   web:
   db:
 
 volumes:
-  letsencrypt:
+  acme:
   sonarqube_data:
   sonarqube_extensions:
   sonarqube_logs:

@@ -4,16 +4,16 @@ Minimal SonarQube stack in one `docker-compose.yml`:
 
 | Service     | Image                                      | Purpose                                         |
 |-------------|--------------------------------------------|-------------------------------------------------|
-| `traefik`   | `traefik:v3.7.19`                          | Reverse proxy, HTTP→HTTPS, Let's Encrypt (ACME) |
+| `traefik`   | `traefik:v3.7.19`                          | Reverse proxy, HTTP→HTTPS, company ACME (EAB)   |
 | `sonarqube` | `sonarqube:2026.5.5-developer`             | SonarQube Server Developer (2026.5 LTA)         |
 | `postgres`  | `postgres:18.7`                            | Database                                        |
 | `pgbackup`  | `prodrigestivill/postgres-backup-local:18` | Scheduled `pg_dump` with retention              |
-| `alloy`     | `grafana/alloy:v1.22.0`                    | Sidecar: logs → Loki, metrics → Mimir           |
+| `alloy`     | `grafana/alloy:v1.22.0`                    | Sidecar: SonarQube + host telemetry → Loki/Mimir |
 
 ## Start
 
 ```bash
-cp .env.example .env      # set POSTGRES_PASSWORD, SONAR_MONITORING_PASSCODE, ACME_EMAIL, SONAR_HOST
+cp .env.example .env      # set passwords, SONAR_HOST and the ACME_* values
 docker compose up -d
 ```
 
@@ -22,11 +22,22 @@ SonarQube is served at `https://${SONAR_HOST}` (default `sonarqube.org`). The fi
 
 ## TLS
 
-Traefik's built-in ACME client requests and renews the certificate with an HTTP-01 challenge, so certbot isn't needed.
-Port 80 must be reachable from the internet for that domain. Certificates are kept in the `letsencrypt` volume.
+Certificates come from the **company ACME server**. Traefik's built-in ACME client (lego) does issuance and renewal, so certbot isn't needed.
+It uses External Account Binding (EAB) and the HTTP-01 challenge. The ACME server must be able to reach port 80 for `SONAR_HOST`.
 
-* Set `ACME_CA_SERVER=https://acme-staging-v02.api.letsencrypt.org/directory` for a dry run.
-* Set `TLS_CERTRESOLVER=` (empty) for local or lab use. Traefik then serves its self-signed default certificate and never contacts Let's Encrypt.
+| Variable               | Meaning                                                                                  |
+|------------------------|------------------------------------------------------------------------------------------|
+| `ACME_CA_SERVER`       | Directory URL, e.g. `https://acme.company.example/acme/directory`                        |
+| `ACME_EAB_KID`         | EAB key identifier from the CA                                                           |
+| `ACME_EAB_HMAC`        | EAB HMAC key, base64url-encoded (as handed out by the CA)                                |
+| `ACME_EMAIL`           | Account contact address                                                                  |
+| `ACME_KEY_TYPE`        | Certificate key type, default `EC256` (`RSA2048`, `RSA4096`, … if the CA requires RSA)   |
+| `ACME_CA_CERTIFICATES` | Optional. Path of the company root CA PEM (put it in `./certs/`, e.g. `/certs/company-root-ca.pem`) if the ACME endpoint's own TLS certificate isn't publicly trusted |
+| `TLS_CERTRESOLVER`     | `company` (default). Leave it empty to skip ACME and serve Traefik's self-signed certificate (lab use) |
+
+Certificates and the ACME account are stored in the `acme` volume (`/acme/acme.json`).
+If the CA wants DNS-01 or TLS-ALPN-01 instead of HTTP-01, replace the `httpchallenge` flag in `docker-compose.yml`.
+The options are `--certificatesresolvers.company.acme.tlschallenge=true`, or `...dnschallenge.provider=<provider>` plus that provider's env vars.
 
 ## Backups
 
@@ -45,17 +56,17 @@ Restore into an empty database. Drop and recreate it first, or restore into a fr
 
 ## Observability (Grafana Alloy sidecar)
 
-Alloy's config is in [`alloy/config.alloy`](alloy/config.alloy). Alloy's UI is on container port 12345, which isn't published.
+[`alloy/config.alloy`](alloy/config.alloy) watches only SonarQube and the host:
 
-* **Logs**: Alloy reads the Docker logs of every container in compose project `sonarr` and pushes them to Loki (`LOKI_URL`) with the labels `service_name`, `container` and `project="sonarr"`.
-* **Metrics**: Alloy pushes these to Mimir (`MIMIR_URL`) with Prometheus remote write. Every series gets `project="sonarr"`.
-  * `job="sonarr/traefik"`: Traefik's Prometheus metrics, served on the internal entrypoint `:8082`.
-  * `job="sonarr/sonarqube"`: `/api/monitoring/metrics`, authenticated with `SONAR_MONITORING_PASSCODE`. SonarQube receives it as `SONAR_WEB_SYSTEMPASSCODE`.
-  * `job="sonarr/postgres"`: Alloy's built-in postgres exporter.
+* **Logs → Loki** (`LOKI_URL`): SonarQube's log files (`sonar`, `web`, `ce`, `es`, `access`). Alloy reads them from the `sonarqube_logs` volume, mounted read-only. Labels: `service_name="sonarqube"`, `filename`.
+* **Metrics → Mimir** (`MIMIR_URL`), all with `project="sonarr"`:
+  * `job="sonarqube"`: `/api/monitoring/metrics`, authenticated with `SONAR_MONITORING_PASSCODE`. SonarQube receives it as `SONAR_WEB_SYSTEMPASSCODE`.
+  * `job="integrations/unix"`: host metrics equivalent to node_exporter. They are read from `/proc`, `/sys` and `/` mounted read-only, with `pid: host`.
 
 The default URLs point at Loki (`:3100`) and Mimir (`:9009`) published on the Docker host. Change them in `.env` for another LGTM stack.
 
-Example queries: `{project="sonarr", service_name="sonarqube"}` in Loki, and `sonarqube_health_web_status` or `pg_up{job="sonarr/postgres"}` in Mimir.
+Example queries: `{service_name="sonarqube", filename=~".*/web.log"}` in Loki, and `sonarqube_health_web_status` or `node_load1{project="sonarr"}` in Mimir.
+Network-interface metrics show the container's own interfaces, not the host's. Add `network_mode: host` to `alloy` if you need host NIC stats. It then reaches SonarQube via the published HTTPS URL instead of `sonarqube:9000`.
 
 ## Further guides
 
