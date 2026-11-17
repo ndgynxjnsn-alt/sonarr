@@ -1,0 +1,142 @@
+# Sonarr: SonarQube Developer + PostgreSQL 18 behind Traefik (TLS / ACME),
+# with periodic pg_dump backups and a Grafana Alloy sidecar shipping logs and
+# metrics to an external LGTM stack (Loki + Mimir).
+#
+#   Internet --443--> traefik --> sonarqube --> postgres <-- pgbackup (pg_dump)
+#   alloy: docker logs + /metrics scrapes  -->  Loki / Mimir
+#
+# Copy .env.example to .env and fill in the secrets before `docker compose up -d`.
+
+name: sonarr
+
+services:
+  traefik:
+    image: traefik:v3.7.19
+    restart: unless-stopped
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=sonarr_web
+      - --entrypoints.web.address=:80
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --entrypoints.websecure.address=:443
+      # Let's Encrypt via the built-in ACME client (HTTP-01). Traefik renews
+      # automatically ~30 days before expiry; no certbot needed.
+      - --certificatesresolvers.le.acme.email=${ACME_EMAIL}
+      - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.le.acme.caserver=${ACME_CA_SERVER:-https://acme-v02.api.letsencrypt.org/directory}
+      - --certificatesresolvers.le.acme.httpchallenge.entrypoint=web
+      # Prometheus metrics on an internal-only entrypoint (scraped by alloy).
+      - --entrypoints.metrics.address=:8082
+      - --metrics.prometheus.entrypoint=metrics
+      - --global.aliasheadersstrategy=delete
+      - --log.level=INFO
+      - --accesslog=true
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - letsencrypt:/letsencrypt
+    networks: [web]
+
+  sonarqube:
+    image: sonarqube:2026.5.5-developer
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SONAR_JDBC_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-sonarqube}
+      SONAR_JDBC_USERNAME: ${POSTGRES_USER:-sonarqube}
+      SONAR_JDBC_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      # Passcode for /api/monitoring/metrics (Prometheus), used by alloy.
+      SONAR_WEB_SYSTEMPASSCODE: ${SONAR_MONITORING_PASSCODE:?set SONAR_MONITORING_PASSCODE in .env}
+    volumes:
+      - sonarqube_data:/opt/sonarqube/data
+      - sonarqube_extensions:/opt/sonarqube/extensions
+      - sonarqube_logs:/opt/sonarqube/logs
+    ulimits:
+      nofile: { soft: 131072, hard: 131072 }
+      nproc: 8192
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.sonarqube.rule=Host(`${SONAR_HOST:-sonarqube.org}`)
+      - traefik.http.routers.sonarqube.entrypoints=websecure
+      - traefik.http.routers.sonarqube.tls=true
+      # Empty TLS_CERTRESOLVER = no ACME, Traefik serves its self-signed default cert.
+      - traefik.http.routers.sonarqube.tls.certresolver=${TLS_CERTRESOLVER-le}
+      - traefik.http.services.sonarqube.loadbalancer.server.port=9000
+    networks: [web, db]
+
+  postgres:
+    image: postgres:18.7
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-sonarqube}
+      POSTGRES_USER: ${POSTGRES_USER:-sonarqube}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    # PG 18 images keep data in /var/lib/postgresql/18/docker; mount the parent.
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [db]
+
+  pgbackup:
+    image: prodrigestivill/postgres-backup-local:18
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: ${POSTGRES_DB:-sonarqube}
+      POSTGRES_USER: ${POSTGRES_USER:-sonarqube}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      SCHEDULE: ${BACKUP_SCHEDULE:-@daily}
+      BACKUP_KEEP_DAYS: ${BACKUP_KEEP_DAYS:-7}
+      BACKUP_KEEP_WEEKS: ${BACKUP_KEEP_WEEKS:-4}
+      BACKUP_KEEP_MONTHS: ${BACKUP_KEEP_MONTHS:-6}
+    volumes:
+      - ${BACKUP_DIR:-./backups}:/backups
+    networks: [db]
+
+  # Observability sidecar: tails the stack's container logs and scrapes
+  # traefik, sonarqube and postgres metrics, then pushes to Loki and Mimir.
+  alloy:
+    image: grafana/alloy:v1.22.0
+    restart: unless-stopped
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    environment:
+      LOKI_URL: ${LOKI_URL:-http://host.docker.internal:3100/loki/api/v1/push}
+      MIMIR_URL: ${MIMIR_URL:-http://host.docker.internal:9009/api/v1/push}
+      SONAR_MONITORING_PASSCODE: ${SONAR_MONITORING_PASSCODE}
+      POSTGRES_DSN: postgresql://${POSTGRES_USER:-sonarqube}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-sonarqube}?sslmode=disable
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - alloy_data:/var/lib/alloy/data
+    networks: [web, db]
+
+networks:
+  web:
+  db:
+
+volumes:
+  letsencrypt:
+  sonarqube_data:
+  sonarqube_extensions:
+  sonarqube_logs:
+  postgres_data:
+  alloy_data:
