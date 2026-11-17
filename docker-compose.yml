@@ -42,7 +42,8 @@ services:
     networks: [web]
 
   sonarqube:
-    image: sonarqube:2026.5.5-developer
+    # Override SONARQUBE_VERSION only while hopping through LTAs (see upgrade.md).
+    image: sonarqube:${SONARQUBE_VERSION:-2026.5.5}-developer
     restart: unless-stopped
     depends_on:
       postgres:
